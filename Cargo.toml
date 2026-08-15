@@ -1,0 +1,43 @@
+[package]
+name = "mcpg-cluster-api"
+version = "0.1.0-beta.13"
+license = "Apache-2.0"
+edition = "2024"
+description = """
+Trait surface for the MCPG cluster backbone. Exposes four orthogonal
+primitives that any cluster backend (single-node, redis, nats, consul,
+etcd, …) can implement à la carte:
+
+
+  - `KeyValueStore` — durable namespaced key/value
+  - `PubSub` — topic-based fire-and-forget messaging
+  - `Lease` — time-bounded distributed locks with monotonic fence tokens
+  - `Watch` — durable change-notification feeds over key prefixes
+
+Plus the higher-level `ClusterBackend` trait that bundles the
+primitives with peer discovery + leader-election semantics.
+
+Every gateway capability (sessions, tasks, pipelines, subscriptions,
+cancellation bus, delivery bus) consumes the primitives directly via
+`Arc<dyn KeyValueStore>` etc.; the cluster plugin is the single source
+that constructs and shares them.
+"""
+
+[dependencies]
+async-trait = "0.1"
+bytes = { version = "1", features = ["serde"] }
+futures = "0.3"
+futures-core = { version = "0.3", default-features = false, features = ["std"] }
+mcpg-plugin-protocol = { git = "https://github.com/mcpg-dev/mcpg-plugin-protocol", tag = "v0.1.0-beta.13", version = "=0.1.0-beta.13" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+tokio = { version = "1", features = ["sync", "time"], optional = true }
+
+[features]
+# Enable the shared contract test suite. Backends turn this on as a
+# dev-dependency feature so their tests run the same battery of
+# correctness checks against the trait implementation.
+test-suite = ["dep:tokio"]
+
+[dev-dependencies]
+serde_json = "1"
