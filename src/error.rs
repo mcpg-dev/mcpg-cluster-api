@@ -4,10 +4,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 /// Failure modes returned by every cluster surface in this crate —
-/// the four primitives ([`crate::KeyValueStore`], [`crate::PubSub`],
-/// [`crate::Lease`], [`crate::Watch`]) plus the higher-level
-/// [`crate::ClusterBackend`] (peers, leadership, distributed
-/// locks, broadcast publish).
+/// the primitives ([`crate::KeyValueStore`], [`crate::PubSub`])
+/// plus the higher-level [`crate::ClusterBackend`] (peers,
+/// leadership, distributed locks, broadcast publish).
 ///
 /// One unified enum keeps the trait surfaces ergonomic — callers
 /// pattern-match on the variant they care about and bubble the rest
@@ -22,9 +21,9 @@ pub enum ClusterError {
     #[error("cluster: key not found: {key}")]
     NotFound { key: String },
 
-    /// Compare-and-swap conflict. Used by [`crate::Lease`] when a
-    /// renew/release sees a different holder or fence token than
-    /// expected.
+    /// Compare-and-swap conflict: a versioned write saw a different
+    /// holder / revision than expected (lease renew/release, CAS
+    /// retry loops inside backends).
     #[error("cluster: cas conflict on `{key}`: {reason}")]
     CasConflict { key: String, reason: String },
 
@@ -34,7 +33,7 @@ pub enum ClusterError {
     Precondition { reason: String },
 
     /// Transport / network / protocol failure. The backend (Raft,
-    /// JetStream, Consul, etcd, redis, …) is unreachable or down.
+    /// JetStream, redis, …) is unreachable or down.
     /// Generally retryable at the caller's discretion.
     #[error("cluster: backend unavailable: {reason}")]
     BackendUnavailable { reason: String },

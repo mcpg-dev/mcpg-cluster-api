@@ -1,9 +1,8 @@
 //! `PubSub` — the transient topic-based fire-and-forget primitive.
 //!
 //! Used by cancellation and delivery buses for cluster-wide
-//! signalling. Distinct from [`crate::watch::Watch`]: pub/sub is
-//! at-most-once with no replay; watch is durable + replayable
-//! within retention.
+//! signalling. At-most-once with no replay: a subscriber that
+//! connects after a publish never sees it.
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -27,7 +26,6 @@ pub type Subscription = BoxStream<'static, Result<Message, ClusterError>>;
 /// - Single-node: in-process tokio::broadcast
 /// - Redis: PUBLISH / PSUBSCRIBE
 /// - NATS: Core NATS publish + subscribe (queue-group aware)
-/// - etcd / Consul: emulated via Watch / Events (best-effort gossip)
 ///
 /// Delivery is at-most-once and best-effort. Topic patterns may
 /// include `*` (single-token wildcard) and `>` (multi-token, NATS

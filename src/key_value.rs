@@ -86,6 +86,38 @@ pub trait KeyValueStore: Send + Sync + std::fmt::Debug {
     /// Useful for session keep-alive / lease renewal of values
     /// the caller does not want to re-encode.
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError>;
+
+    /// Atomically add `delta` to the integer counter stored under `key`
+    /// and return the post-increment value. A missing (or expired) key
+    /// starts at 0, so the first call returns `delta`. `delta` may be
+    /// negative.
+    ///
+    /// This is the cross-replica **atomic counter** primitive — the
+    /// building block for rate-limit token accounting and monotonic
+    /// per-session sequences. Unlike a `get`-then-`put`, no two
+    /// concurrent callers (on any number of replicas) can observe the
+    /// same post-increment value or lose an update. Implementations
+    /// MUST be atomic against the backing store (memory:
+    /// add-under-shard-lock; redis: `INCRBY` in a Lua script; nats
+    /// JetStream KV: revision CAS loop; file: RMW under one
+    /// in-process lock — that backend is single-process by contract).
+    /// There is deliberately **no default impl** — a non-atomic
+    /// get+put would silently defeat the contract, so every backend
+    /// must provide a genuinely atomic implementation (or document why
+    /// it can't, as the plugin-`Store` adapter does).
+    ///
+    /// The counter is stored as its ASCII base-10 representation, so
+    /// `get` on a counter key returns e.g. `b"42"` on every backend
+    /// and `incr` on a key holding a non-integer value returns
+    /// [`ClusterError::Precondition`] (as does i64 overflow).
+    ///
+    /// `ttl` semantics differ from `put`: `Some` re-applies the TTL to
+    /// the key on **every** call (sliding expiry — an idle counter
+    /// vanishes, an active one persists); `None` leaves any existing
+    /// expiry unchanged (a fresh key created by a `None` call has no
+    /// TTL).
+    async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>)
+    -> Result<i64, ClusterError>;
 }
 
 // ---------------------------------------------------------------------------
@@ -174,6 +206,37 @@ pub struct KvExpireArgs {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+}
+
+/// Args for the `kv_incr` slot. The reply is the post-increment value
+/// (`Result<i64, ClusterError>` via the result envelope).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KvIncrArgs {
+    pub key: String,
+    pub delta: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_ms: Option<u64>,
+}
+
+/// Decode a stored counter value for [`KeyValueStore::incr`]. Strict
+/// ASCII base-10 (optional leading `-`), matching what redis `INCRBY`
+/// accepts, so every backend agrees on which values are counters.
+pub fn parse_counter(bytes: &[u8]) -> Result<i64, ClusterError> {
+    std::str::from_utf8(bytes)
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .ok_or_else(|| ClusterError::Precondition {
+            reason: "incr target holds a non-integer value".into(),
+        })
+}
+
+/// The error [`KeyValueStore::incr`] returns when the addition would
+/// overflow i64 (mirrors redis' `INCRBY` overflow error).
+#[must_use]
+pub fn counter_overflow() -> ClusterError {
+    ClusterError::Precondition {
+        reason: "incr overflows the 64-bit counter range".into(),
+    }
 }
 
 #[cfg(test)]

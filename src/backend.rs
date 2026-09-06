@@ -1,11 +1,10 @@
 //! `cluster_backend` — peer discovery, leader election for
 //! singleton roles, fenced distributed locks, and notification
-//! routing — bundled as a single trait surface alongside the four
-//! orthogonal primitives ([`crate::KeyValueStore`], [`crate::PubSub`],
-//! [`crate::Lease`], [`crate::Watch`]).
+//! routing — bundled as a single trait surface alongside the two
+//! orthogonal primitives ([`crate::KeyValueStore`], [`crate::PubSub`]).
 //!
-//! Most cluster backends (Raft libraries, NATS JetStream, Consul,
-//! etcd, redis with Lua scripts) provide all of these with a shared
+//! Most cluster backends (Raft libraries, NATS JetStream, redis
+//! with Lua scripts) provide all of these with a shared
 //! quorum boundary, so they live behind a single entity kind to
 //! avoid mismatched quorum across primitives.
 //!
@@ -35,7 +34,7 @@ use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::error::ClusterError;
-use crate::{KeyValueStore, Lease, PubSub, Watch};
+use crate::{KeyValueStore, PubSub};
 use mcpg_plugin_protocol::manifest::PluginManifest;
 
 /// Health classification of a peer as observed by the local node.
@@ -111,7 +110,7 @@ pub struct PublishedMessage {
     pub routing_key: Option<String>,
     pub payload: Bytes,
     /// Publisher node id — best-effort and NOT an authenticated signal: on
-    /// NATS it is a self-asserted, forgeable header; on redis/etcd/consul the
+    /// NATS it is a self-asserted, forgeable header; on redis the
     /// wire envelope carries no sender, so it is filled from the subscriber's
     /// own node id. Use for diagnostics only, never for an authorization
     /// decision.
@@ -136,16 +135,8 @@ pub type BoxPublishedMessageStream =
 ///
 /// Returned as a boxed trait object so different backends can
 /// ship wildly different handle internals (Raft log index, NATS
-/// KV revision, Consul session id, etcd lease id, ...) without
+/// KV revision, ...) without
 /// leaking those details across the ABI.
-///
-/// Disambiguation: this trait is the *active* coordinator-managed
-/// lease, complete with `renew` / `release` methods. The crate also
-/// exposes a [`crate::LeaseHandle`] **struct** returned by the
-/// primitive [`crate::Lease`] trait — that's an opaque snapshot of
-/// lease metadata (name, holder, fence, expiry); the primitive
-/// trait's CAS-style `renew` / `release` methods take it as an
-/// argument rather than as `&self`.
 #[async_trait::async_trait]
 pub trait ActiveLease: Send + Sync {
     /// Strictly-monotonic fencing token. Per lock key / role,
@@ -177,11 +168,11 @@ pub type BoxActiveLease = Box<dyn ActiveLease>;
 
 /// The cluster-coordinator entity trait. Spec §9.13.
 ///
-/// Implementors expose four orthogonal primitives via the
-/// `key_value_store` / `pub_sub` / `lease` / `watch` accessors plus
-/// the coordinator-level surface (peer discovery, leader election,
-/// distributed locks, broadcast publish/subscribe). Any subset of the
-/// primitive accessors may return `None`.
+/// Implementors expose two orthogonal primitives via the
+/// `key_value_store` / `pub_sub` accessors plus the
+/// coordinator-level surface (peer discovery, leader election,
+/// distributed locks, broadcast publish/subscribe). Either
+/// primitive accessor may return `None`.
 ///
 /// Which gateway *slots* a coordinator can back is declared separately
 /// via [`cluster_provides`](ClusterBackend::cluster_provides) (the
@@ -221,10 +212,9 @@ pub trait ClusterBackend: Send + Sync {
     }
 
     /// Optional [`KeyValueStore`] primitive. Cluster plugins return
-    /// `Some` when they provide durable namespaced KV (redis, nats
-    /// JetStream, single-node memory/file). `None` for backends that
-    /// don't ship a KV (consul / etcd in v0.1 — operators wire a
-    /// per-capability `store:` override).
+    /// `Some` when they provide durable namespaced KV (every in-tree
+    /// coordinator does); `None` sends capabilities to their
+    /// per-capability `store:` override / built-in fallback.
     fn key_value_store(&self) -> Option<Arc<dyn KeyValueStore>> {
         None
     }
@@ -233,21 +223,6 @@ pub trait ClusterBackend: Send + Sync {
     /// transient topic-based fire-and-forget messaging (redis pub/sub,
     /// nats core, single-node broadcast); `None` otherwise.
     fn pub_sub(&self) -> Option<Arc<dyn PubSub>> {
-        None
-    }
-
-    /// Optional [`Lease`] primitive. `Some` for backends with native
-    /// or constructible split-brain-safe leases (redis SETNX + Lua,
-    /// nats JetStream KV CAS, etcd lease, consul session, single-node
-    /// always-acquire). Most cluster backends implement this.
-    fn lease(&self) -> Option<Arc<dyn Lease>> {
-        None
-    }
-
-    /// Optional [`Watch`] primitive. `Some` for backends with native
-    /// change-notification feeds (etcd watch, nats KV watch, consul
-    /// blocking queries, single-node broadcast); `None` otherwise.
-    fn watch(&self) -> Option<Arc<dyn Watch>> {
         None
     }
 
@@ -286,8 +261,8 @@ pub trait ClusterBackend: Send + Sync {
     /// waiting for leadership rotation would defeat the loop's
     /// purpose. The default impl falls back to `acquire_leadership`
     /// and is therefore blocking — backends that have a native
-    /// non-blocking acquire (Consul `?cas=`, etcd lease+txn,
-    /// JetStream KV CAS, redis SETNX) override it for true
+    /// non-blocking acquire (JetStream KV CAS, redis SETNX)
+    /// override it for true
     /// try-semantics. Backends that don't override pay no
     /// correctness penalty; they just pay the same wait cost as
     /// the blocking variant.

@@ -51,8 +51,8 @@ connection.
   filtering, TTL purge and overwrite semantics.
 
 ## Used by
-- The cluster backend plugins under `libs/plugins/cluster/` — `redis`, `nats`,
-  `consul` and `etcd` — plus their shared equivalence-test suites. The gateway's
+- The cluster backend plugins under `libs/plugins/cluster/` — `redis` and
+  `nats` — plus their shared equivalence-test suites. The gateway's
   built-in `single_node` mode needs no plugin.
 - `apps/gateway`, where sessions, tasks, pipelines, subscriptions and the
   cancellation and delivery buses consume the primitives directly.
