@@ -172,9 +172,15 @@ impl KvEntryWire {
 }
 
 /// Args for the `kv_get` / `kv_delete` slots.
+///
+/// `store`, on every KV slot's args, names a store of its own the caller
+/// wants (see `ClusterBackend::key_value_store_named`); absent, the
+/// coordinator's shared one. A coordinator that keeps one store ignores it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvKeyArgs {
     pub key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// Args for the `kv_put` / `kv_put_if_absent` slots.
@@ -184,6 +190,8 @@ pub struct KvPutArgs {
     pub value: Vec<u8>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// Args for the `kv_list_prefix` slot.
@@ -191,6 +199,8 @@ pub struct KvPutArgs {
 pub struct KvListPrefixArgs {
     pub prefix: String,
     pub limit: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// One `(key, entry)` pair in a `kv_list_prefix` reply.
@@ -206,6 +216,8 @@ pub struct KvExpireArgs {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// Args for the `kv_incr` slot. The reply is the post-increment value
@@ -216,6 +228,8 @@ pub struct KvIncrArgs {
     pub delta: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub store: Option<String>,
 }
 
 /// Decode a stored counter value for [`KeyValueStore::incr`]. Strict

@@ -219,6 +219,15 @@ pub trait ClusterBackend: Send + Sync {
         None
     }
 
+    /// A key/value store of its own named `name`, for state that must not
+    /// share the bounded store of [`Self::key_value_store`] (NATS JetStream
+    /// gives it a bucket of its own). A coordinator with one keyspace
+    /// returns its shared store.
+    fn key_value_store_named(&self, name: &str) -> Option<Arc<dyn KeyValueStore>> {
+        let _ = name;
+        self.key_value_store()
+    }
+
     /// Optional [`PubSub`] primitive. `Some` for backends with
     /// transient topic-based fire-and-forget messaging (redis pub/sub,
     /// nats core, single-node broadcast); `None` otherwise.
