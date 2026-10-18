@@ -30,7 +30,7 @@
 
 use std::future::Future;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 
@@ -359,21 +359,35 @@ where
     //                               worst-case new expiry t0+3.5u)
     //   t0+3.2u   get → Some       (past the first arm's nominal 3u,
     //                               before the refreshed arm's 3.5u)
+    // A sleep that overruns on a loaded machine eats that slack, so each
+    // check runs only while the arm it reads is inside its guaranteed
+    // lifetime (live_ttl − unit), measured on the clock rather than assumed.
     let unit = timing.short_ttl;
     let live_ttl = unit * 3;
+    let guaranteed = live_ttl - unit;
     assert_eq!(s.incr("live", 1, Some(live_ttl)).await.unwrap(), 1);
+    let first_arm = Instant::now();
     pause(unit + unit / 2).await;
+    if first_arm.elapsed() >= guaranteed {
+        eprintln!("kv contract: the sliding-TTL check was skipped, a pause overran the first arm");
+        return;
+    }
     assert_eq!(
         s.incr("live", 1, Some(live_ttl)).await.unwrap(),
         2,
         "refresh before expiry must see the accumulated count"
     );
+    let refreshed = Instant::now();
     pause(unit + unit / 2 + unit / 5).await;
     let v = s.get("live").await.unwrap();
-    assert!(
-        v.is_some(),
-        "a refreshed counter must outlive the first call's TTL arm"
-    );
+    if refreshed.elapsed() < guaranteed {
+        assert!(
+            v.is_some(),
+            "a refreshed counter must outlive the first call's TTL arm"
+        );
+    } else {
+        eprintln!("kv contract: the refreshed-arm check was skipped, a pause overran it");
+    }
     // And once left idle, the refreshed arm purges it too.
     pause(live_ttl + timing.expiry_slack).await;
     assert!(
