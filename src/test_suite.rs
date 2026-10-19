@@ -354,31 +354,36 @@ where
     // granularity unit of slack on both sides, because a
     // whole-second backend (nats / file) may truncate a TTL's
     // effective lifetime by up to one unit:
-    //   t0        incr, ttl = 3u   (worst-case lifetime 2u..3u)
-    //   t0+1.5u   incr, ttl = 3u   (before the first arm can lapse;
-    //                               worst-case new expiry t0+3.5u)
-    //   t0+3.2u   get → Some       (past the first arm's nominal 3u,
-    //                               before the refreshed arm's 3.5u)
-    // A sleep that overruns on a loaded machine eats that slack, so each
-    // check runs only while the arm it reads is inside its guaranteed
-    // lifetime (live_ttl − unit), measured on the clock rather than assumed.
+    //   t0        incr, ttl = 4u   (worst-case lifetime 3u..4u)
+    //   t0+2u     incr, ttl = 4u   (before the first arm can lapse;
+    //                               worst-case new expiry t0+5u)
+    //   t0+4.2u   get → Some       (past the first arm's nominal 4u,
+    //                               before the refreshed arm's 5u)
+    // A slow call or a sleep that overruns on a loaded machine eats that
+    // slack, so each check runs only when the read it makes falls inside the
+    // guaranteed lifetime (live_ttl − unit) of the arm it reads: the refresh
+    // has a unit for its calls, the get 0.8 of one. An arm starts inside its
+    // incr, so its clock is read before that call, and the check after the
+    // read it guards returns.
     let unit = timing.short_ttl;
-    let live_ttl = unit * 3;
+    let live_ttl = unit * 4;
     let guaranteed = live_ttl - unit;
-    assert_eq!(s.incr("live", 1, Some(live_ttl)).await.unwrap(), 1);
     let first_arm = Instant::now();
-    pause(unit + unit / 2).await;
+    assert_eq!(s.incr("live", 1, Some(live_ttl)).await.unwrap(), 1);
+    pause(unit * 2).await;
+    let refreshed = Instant::now();
+    let count = s.incr("live", 1, Some(live_ttl)).await.unwrap();
     if first_arm.elapsed() >= guaranteed {
-        eprintln!("kv contract: the sliding-TTL check was skipped, a pause overran the first arm");
+        eprintln!(
+            "kv contract: the sliding-TTL check was skipped, a call or pause overran the first arm"
+        );
         return;
     }
     assert_eq!(
-        s.incr("live", 1, Some(live_ttl)).await.unwrap(),
-        2,
+        count, 2,
         "refresh before expiry must see the accumulated count"
     );
-    let refreshed = Instant::now();
-    pause(unit + unit / 2 + unit / 5).await;
+    pause(unit * 2 + unit / 5).await;
     let v = s.get("live").await.unwrap();
     if refreshed.elapsed() < guaranteed {
         assert!(
@@ -386,7 +391,7 @@ where
             "a refreshed counter must outlive the first call's TTL arm"
         );
     } else {
-        eprintln!("kv contract: the refreshed-arm check was skipped, a pause overran it");
+        eprintln!("kv contract: the refreshed-arm check was skipped, a call or pause overran it");
     }
     // And once left idle, the refreshed arm purges it too.
     pause(live_ttl + timing.expiry_slack).await;
