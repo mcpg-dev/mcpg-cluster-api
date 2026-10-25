@@ -8,7 +8,7 @@
 //! ## Primitives
 //!
 //! - [`KeyValueStore`] — durable namespaced key/value (get / put /
-//!   delete / list_prefix / expire / incr). Every cluster backend
+//!   delete / list_page / expire / incr). Every cluster backend
 //!   implements this; it's the canonical state surface. `incr` is
 //!   the atomic cross-replica counter (rate-limit accounting,
 //!   monotonic sequences); `put_if_absent` is the single-winner
@@ -59,6 +59,7 @@ pub use backend::{
 pub use error::ClusterError;
 pub use key_value::{
     Entry, KeyValueStore, KvEntryWire, KvExpireArgs, KvIncrArgs, KvKeyArgs, KvListEntryWire,
-    KvListPrefixArgs, KvPutArgs, counter_overflow, parse_counter,
+    KvListPrefixArgs, KvListReplyWire, KvPage, KvPageWire, KvPutArgs, LIST_PAGE_SIZE,
+    counter_overflow, list_all, parse_counter,
 };
 pub use pub_sub::{Message, PubSub, Subscription};

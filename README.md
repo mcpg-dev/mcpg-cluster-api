@@ -14,11 +14,14 @@ connection.
 
 ## What's here
 - `KeyValueStore` — durable namespaced key/value: `get`, `put`, `put_if_absent`,
-  `delete`, `list_prefix`, `expire`, returning `Entry { bytes, expires_at }`.
-  `put_if_absent` is the cross-replica single-winner claim primitive behind
-  idempotency reservations and race-free resource claims, and it deliberately
-  has no default implementation so that no backend can satisfy it with a
-  non-atomic get-then-put.
+  `delete`, `list_page`, `expire`, `incr`, returning `Entry { bytes, expires_at }`.
+  An expired entry counts as absent everywhere. `put_if_absent` is the
+  cross-replica single-winner claim primitive behind idempotency reservations
+  and race-free resource claims, and it deliberately has no default
+  implementation so that no backend can satisfy it with a non-atomic
+  get-then-put. `list_page` pages through a prefix with an opaque cursor (a
+  complete pass sees every key that lives through it, like Redis `SCAN`);
+  `list_prefix` is the bounded helper on top of it.
 - `PubSub` — `publish` and `subscribe(pattern, queue_group)` over a
   `Message { topic, payload }` stream. At-most-once with no replay; the
   cancellation and delivery buses use it.

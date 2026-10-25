@@ -23,6 +23,69 @@ pub struct Entry {
     pub expires_at: Option<std::time::SystemTime>,
 }
 
+/// One page of a [`KeyValueStore::list_page`] pass.
+#[derive(Debug, Clone, Default)]
+pub struct KvPage {
+    pub entries: Vec<(String, Entry)>,
+    /// The cursor of the next page; `None` when the pass is complete.
+    pub next: Option<String>,
+}
+
+/// Page size [`KeyValueStore::list_prefix`] asks [`KeyValueStore::list_page`] for.
+pub const LIST_PAGE_SIZE: usize = 512;
+
+/// Every live `(key, value)` pair under `prefix`: one complete pass of
+/// [`KeyValueStore::list_page`], each key once, in key order.
+pub async fn list_all(
+    store: &(impl KeyValueStore + ?Sized),
+    prefix: &str,
+) -> Result<Vec<(String, Entry)>, ClusterError> {
+    let mut found = std::collections::BTreeMap::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = store
+            .list_page(prefix, cursor.as_deref(), LIST_PAGE_SIZE)
+            .await?;
+        // A key written during the pass can come twice; the later copy is
+        // the newer value.
+        found.extend(page.entries);
+        match page.next {
+            Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+            _ => break,
+        }
+    }
+    Ok(found.into_iter().collect())
+}
+
+impl KvPage {
+    /// The page of a store that can enumerate its live entries in any
+    /// order: the keys under `prefix` after `cursor` in byte order, at most
+    /// `limit` of them; the cursor is the last key of the page.
+    #[must_use]
+    pub fn from_unordered(
+        entries: impl IntoIterator<Item = (String, Entry)>,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Self {
+        let limit = limit.max(1);
+        let mut picked: Vec<(String, Entry)> = entries
+            .into_iter()
+            .filter(|(key, _)| key.starts_with(prefix) && cursor.is_none_or(|c| key.as_str() > c))
+            .collect();
+        picked.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+        let more = picked.len() > limit;
+        picked.truncate(limit);
+        let next = more
+            .then(|| picked.last().map(|(key, _)| key.clone()))
+            .flatten();
+        Self {
+            entries: picked,
+            next,
+        }
+    }
+}
+
 /// Durable namespaced key/value store.
 ///
 /// Keys are operator-bounded. The backend may impose a maximum key
@@ -67,22 +130,52 @@ pub trait KeyValueStore: Send + Sync + std::fmt::Debug {
     /// exist (idempotent), `Ok(true)` when deletion happened.
     async fn delete(&self, key: &str) -> Result<bool, ClusterError>;
 
-    /// List all `(key, value)` pairs under `prefix`. The order is
-    /// implementation-defined and may not be lexicographic;
-    /// callers that need a specific order must sort post-hoc.
+    /// List the live `(key, value)` pairs under `prefix`, one page at a
+    /// time: `cursor` is `None` for the first page and the previous page's
+    /// [`KvPage::next`] after it; the pass is complete when `next` is
+    /// `None`.
     ///
-    /// `limit` caps the number of entries returned. Backends may
-    /// return fewer than `limit` entries even when more exist
-    /// (paging is intentionally not exposed at the trait surface;
-    /// callers needing pagination use a backend-aware adapter).
+    /// A page holds at most `limit` entries (a `limit` of 0 counts as 1) and
+    /// may hold fewer, also none, while `next` is still `Some`. A complete
+    /// pass returns at least once every key that is live for the whole
+    /// pass; a key written or removed during the pass may or may not
+    /// appear, and a key may appear twice. The order is
+    /// implementation-defined. The cursor is opaque and valid only for the
+    /// same `prefix` on the same store.
+    async fn list_page(
+        &self,
+        prefix: &str,
+        cursor: Option<&str>,
+        limit: usize,
+    ) -> Result<KvPage, ClusterError>;
+
+    /// Up to `limit` live `(key, value)` pairs under `prefix`: the pages of
+    /// [`Self::list_page`] in order, cut at `limit`. A caller that must see
+    /// every key pages with [`Self::list_page`] instead.
     async fn list_prefix(
         &self,
         prefix: &str,
         limit: usize,
-    ) -> Result<Vec<(String, Entry)>, ClusterError>;
+    ) -> Result<Vec<(String, Entry)>, ClusterError> {
+        let mut out = Vec::new();
+        let mut cursor: Option<String> = None;
+        while out.len() < limit {
+            let want = (limit - out.len()).min(LIST_PAGE_SIZE);
+            let page = self.list_page(prefix, cursor.as_deref(), want).await?;
+            let room = limit - out.len();
+            out.extend(page.entries.into_iter().take(room));
+            match page.next {
+                // A backend that hands back the cursor it got would loop.
+                Some(next) if cursor.as_deref() != Some(next.as_str()) => cursor = Some(next),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
 
     /// Update only the TTL of an existing key, leaving the value
-    /// unchanged. Returns `Ok(false)` when the key does not exist.
+    /// unchanged. Returns `Ok(false)` when the key does not exist (an
+    /// *expired* entry counts as absent).
     /// Useful for session keep-alive / lease renewal of values
     /// the caller does not want to re-encode.
     async fn expire(&self, key: &str, ttl: Option<Duration>) -> Result<bool, ClusterError>;
@@ -195,10 +288,19 @@ pub struct KvPutArgs {
 }
 
 /// Args for the `kv_list_prefix` slot.
+///
+/// Without `page`, the reply is the bare `Vec<KvListEntryWire>` of the first
+/// `limit` entries. With `page`, it is a [`KvPageWire`] that starts after
+/// `cursor`. A coordinator that predates `page` ignores both fields and
+/// answers with the bare list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvListPrefixArgs {
     pub prefix: String,
     pub limit: u64,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub page: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
 }
@@ -208,6 +310,76 @@ pub struct KvListPrefixArgs {
 pub struct KvListEntryWire {
     pub key: String,
     pub entry: KvEntryWire,
+}
+
+/// A `kv_list_prefix` reply as the host reads it: a page from a coordinator
+/// that pages, or the bare list from one that predates `page` (one page, and
+/// the last).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum KvListReplyWire {
+    Page(KvPageWire),
+    List(Vec<KvListEntryWire>),
+}
+
+impl KvListReplyWire {
+    /// Decode into a [`KvPage`]; a bare list ends the pass.
+    #[must_use]
+    pub fn into_page(self) -> KvPage {
+        match self {
+            Self::Page(page) => page.into_page(),
+            Self::List(list) => KvPageWire {
+                entries: list,
+                next: None,
+            }
+            .into_page(),
+        }
+    }
+
+    /// Whether the coordinator answered with a page.
+    #[must_use]
+    pub fn is_page(&self) -> bool {
+        matches!(self, Self::Page(_))
+    }
+}
+
+/// Wire form of a [`KvPage`], the paged `kv_list_prefix` reply.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KvPageWire {
+    pub entries: Vec<KvListEntryWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next: Option<String>,
+}
+
+impl KvPageWire {
+    /// Encode a [`KvPage`] for the wire.
+    #[must_use]
+    pub fn from_page(page: &KvPage) -> Self {
+        Self {
+            entries: page
+                .entries
+                .iter()
+                .map(|(key, entry)| KvListEntryWire {
+                    key: key.clone(),
+                    entry: KvEntryWire::from_entry(entry),
+                })
+                .collect(),
+            next: page.next.clone(),
+        }
+    }
+
+    /// Decode back into a [`KvPage`].
+    #[must_use]
+    pub fn into_page(self) -> KvPage {
+        KvPage {
+            entries: self
+                .entries
+                .into_iter()
+                .map(|e| (e.key, e.entry.into_entry()))
+                .collect(),
+            next: self.next,
+        }
+    }
 }
 
 /// Args for the `kv_expire` slot.
@@ -285,5 +457,55 @@ mod wire_tests {
         assert!(!json.contains("expires_at_unix_ms"));
         let back: KvEntryWire = serde_json::from_str(&json).unwrap();
         assert_eq!(back.into_entry().expires_at, None);
+    }
+
+    #[test]
+    fn a_paged_reply_carries_its_cursor() {
+        let page = KvPage {
+            entries: vec![(
+                "a:1".to_owned(),
+                Entry {
+                    bytes: Bytes::from_static(b"v"),
+                    expires_at: None,
+                },
+            )],
+            next: Some("c1".to_owned()),
+        };
+        let json = serde_json::to_string(&KvPageWire::from_page(&page)).unwrap();
+        let reply: KvListReplyWire = serde_json::from_str(&json).unwrap();
+        assert!(reply.is_page());
+        let back = reply.into_page();
+        assert_eq!(back.next.as_deref(), Some("c1"));
+        assert_eq!(back.entries[0].0, "a:1");
+        assert_eq!(back.entries[0].1.bytes.as_ref(), b"v");
+    }
+
+    #[test]
+    fn a_bare_list_reply_is_the_last_page() {
+        let json = r#"[{"key":"a:1","entry":{"bytes":[118]}}]"#;
+        let reply: KvListReplyWire = serde_json::from_str(json).unwrap();
+        assert!(!reply.is_page());
+        let page = reply.into_page();
+        assert_eq!(page.next, None);
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].1.bytes.as_ref(), b"v");
+    }
+
+    #[test]
+    fn list_args_without_page_stay_the_old_shape() {
+        let args = KvListPrefixArgs {
+            prefix: "a:".into(),
+            limit: 10,
+            page: false,
+            cursor: None,
+            store: None,
+        };
+        assert_eq!(
+            serde_json::to_string(&args).unwrap(),
+            r#"{"prefix":"a:","limit":10}"#
+        );
+        let old: KvListPrefixArgs = serde_json::from_str(r#"{"prefix":"a:","limit":3}"#).unwrap();
+        assert!(!old.page);
+        assert_eq!(old.cursor, None);
     }
 }

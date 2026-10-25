@@ -103,10 +103,14 @@ where
     put_then_get_roundtrips(&make_state).await;
     delete_idempotent(&make_state).await;
     list_prefix_filters_correctly(&make_state).await;
+    list_page_completes_a_pass(&make_state).await;
+    list_page_skips_expired_entries(timing, &make_state).await;
     expire_updates_ttl(&make_state).await;
+    expire_on_an_expired_key_reports_absent(timing, &make_state).await;
     ttl_purges_keys(timing, &make_state).await;
     overwrite_replaces_value_and_ttl(timing, &make_state).await;
     put_if_absent_is_single_winner(&make_state).await;
+    put_if_absent_claims_an_expired_key(timing, &make_state).await;
     incr_missing_key_starts_at_zero(&make_state).await;
     incr_accumulates_and_roundtrips_via_get(&make_state).await;
     incr_no_lost_updates_under_interleaved_callers(&make_state).await;
@@ -145,6 +149,44 @@ where
         .await
         .unwrap();
     assert!(third, "put_if_absent after delete must return true");
+}
+
+async fn put_if_absent_claims_an_expired_key<F, Fut>(timing: KvContractTiming, make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    assert!(
+        s.put_if_absent("lapsed", Bytes::from_static(b"old"), Some(timing.short_ttl))
+            .await
+            .unwrap()
+    );
+    pause(timing.short_ttl + timing.expiry_slack).await;
+    let retaken = s
+        .put_if_absent("lapsed", Bytes::from_static(b"new"), None)
+        .await
+        .unwrap();
+    assert!(
+        retaken,
+        "put_if_absent on an expired claim must win (expired == absent)"
+    );
+    let v = s
+        .get("lapsed")
+        .await
+        .unwrap()
+        .expect("the new claim exists");
+    assert_eq!(&v.bytes[..], b"new");
+    assert!(
+        v.expires_at.is_none(),
+        "the new claim carries its own (absent) TTL"
+    );
+    assert!(
+        !s.put_if_absent("lapsed", Bytes::from_static(b"third"), None)
+            .await
+            .unwrap(),
+        "the renewed claim is live and must not be taken again"
+    );
 }
 
 async fn get_missing_returns_none<F, Fut>(make_state: &F)
@@ -200,6 +242,120 @@ where
     assert!(keys.contains("a:1"));
     assert!(keys.contains("a:2"));
     assert!(!keys.contains("b:1"));
+    let capped = s.list_prefix("a:", 1).await.unwrap();
+    assert_eq!(capped.len(), 1, "list_prefix must stop at its limit");
+}
+
+/// Page through a family large enough to need many pages, next to sibling
+/// families that share its first characters.
+async fn list_page_completes_a_pass<F, Fut>(make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    use std::collections::BTreeSet;
+    let s = make_state().await;
+    const FAMILY: usize = 1200;
+    const PAGE: usize = 100;
+    let mut expected = BTreeSet::new();
+    for i in 0..FAMILY {
+        let key = format!("p:{i:05}");
+        s.put(&key, Bytes::from(key.clone()), None).await.unwrap();
+        expected.insert(key);
+    }
+    for i in 0..150 {
+        s.put(&format!("pa:{i}"), Bytes::from_static(b"sibling"), None)
+            .await
+            .unwrap();
+        s.put(&format!("q:{i}"), Bytes::from_static(b"other"), None)
+            .await
+            .unwrap();
+    }
+
+    let first = s.list_page("p:", None, 0).await.unwrap();
+    assert!(
+        first.entries.len() <= 1,
+        "a limit of 0 counts as 1, got {} entries",
+        first.entries.len()
+    );
+
+    let mut seen = BTreeSet::new();
+    let mut cursor: Option<String> = None;
+    let mut pages = 0usize;
+    loop {
+        pages += 1;
+        assert!(
+            pages <= FAMILY * 2,
+            "a pass of {FAMILY} keys must end; the cursor does not advance"
+        );
+        let page = s.list_page("p:", cursor.as_deref(), PAGE).await.unwrap();
+        assert!(
+            page.entries.len() <= PAGE,
+            "a page holds at most `limit` entries, got {}",
+            page.entries.len()
+        );
+        for (key, entry) in page.entries {
+            assert!(key.starts_with("p:"), "`{key}` is outside the prefix `p:`");
+            assert_eq!(
+                entry.bytes.as_ref(),
+                key.as_bytes(),
+                "`{key}` carries another key's value"
+            );
+            seen.insert(key);
+        }
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    let missing: Vec<_> = expected.difference(&seen).take(5).collect();
+    assert!(
+        missing.is_empty(),
+        "a complete pass must return every live key; {} of {FAMILY} missing, e.g. {missing:?}",
+        expected.difference(&seen).count()
+    );
+}
+
+async fn list_page_skips_expired_entries<F, Fut>(timing: KvContractTiming, make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    s.put("e:short", Bytes::from_static(b"s"), Some(timing.short_ttl))
+        .await
+        .unwrap();
+    s.put("e:long", Bytes::from_static(b"l"), None)
+        .await
+        .unwrap();
+    pause(timing.short_ttl + timing.expiry_slack).await;
+    let mut keys = Vec::new();
+    let mut cursor: Option<String> = None;
+    loop {
+        let page = s.list_page("e:", cursor.as_deref(), 10).await.unwrap();
+        keys.extend(page.entries.into_iter().map(|(k, _)| k));
+        match page.next {
+            Some(next) => cursor = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(
+        keys,
+        vec!["e:long".to_owned()],
+        "an expired entry is absent"
+    );
+    let listed: Vec<_> = s
+        .list_prefix("e:", 10)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|(k, _)| k)
+        .collect();
+    assert_eq!(
+        listed,
+        vec!["e:long".to_owned()],
+        "an expired entry is absent"
+    );
 }
 
 async fn expire_updates_ttl<F, Fut>(make_state: &F)
@@ -216,6 +372,30 @@ where
         .await
         .unwrap();
     assert!(!missing, "expire on missing key returns false");
+}
+
+async fn expire_on_an_expired_key_reports_absent<F, Fut>(timing: KvContractTiming, make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    s.put("gone", Bytes::from_static(b"v"), Some(timing.short_ttl))
+        .await
+        .unwrap();
+    pause(timing.short_ttl + timing.expiry_slack).await;
+    let revived = s
+        .expire("gone", Some(Duration::from_secs(60)))
+        .await
+        .unwrap();
+    assert!(
+        !revived,
+        "expire on an expired key returns false (expired == absent)"
+    );
+    assert!(
+        s.get("gone").await.unwrap().is_none(),
+        "expire must not revive an expired key"
+    );
 }
 
 async fn ttl_purges_keys<F, Fut>(timing: KvContractTiming, make_state: &F)
