@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 use crate::error::ClusterError;
+pub use mcpg_plugin_protocol::wire_bytes::WireBytes;
 
 /// A stored value with optional TTL metadata.
 ///
@@ -226,27 +227,34 @@ pub trait KeyValueStore: Send + Sync + std::fmt::Debug {
 // millisecond stamp — both wire-portable without leaking `SystemTime` /
 // `Duration` representations.
 
+/// The wire feature a coordinator lists under `wire_features` in the manifest
+/// JSON its `manifest` slot returns when it reads a key/value value written as
+/// base64, and answers values as base64 to a call that sets `base64`. The host
+/// writes base64 only to a coordinator that lists it; both sides read either
+/// form, so a host and a coordinator of different releases work together.
+pub const KV_VALUE_BASE64: &str = "kv-value-base64";
+
 /// Wire form of an [`Entry`]. `expires_at_unix_ms` is the absolute expiry as
 /// milliseconds since the Unix epoch (None == no TTL).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KvEntryWire {
-    pub bytes: Vec<u8>,
+    pub bytes: WireBytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub expires_at_unix_ms: Option<u64>,
 }
 
 impl KvEntryWire {
-    /// Encode an [`Entry`] for the wire. An `expires_at` before the epoch
-    /// (impossible in practice) clamps to 0.
+    /// Encode an [`Entry`] for the wire, its value as base64 or as an array.
+    /// An `expires_at` before the epoch (impossible in practice) clamps to 0.
     #[must_use]
-    pub fn from_entry(entry: &Entry) -> Self {
+    pub fn from_entry(entry: &Entry, base64: bool) -> Self {
         let expires_at_unix_ms = entry.expires_at.and_then(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .ok()
                 .map(|d| d.as_millis().min(u128::from(u64::MAX)) as u64)
         });
         Self {
-            bytes: entry.bytes.to_vec(),
+            bytes: WireBytes::new(entry.bytes.to_vec(), base64),
             expires_at_unix_ms,
         }
     }
@@ -258,7 +266,7 @@ impl KvEntryWire {
             .expires_at_unix_ms
             .map(|ms| std::time::UNIX_EPOCH + Duration::from_millis(ms));
         Entry {
-            bytes: Bytes::from(self.bytes),
+            bytes: Bytes::from(self.bytes.bytes),
             expires_at,
         }
     }
@@ -274,13 +282,17 @@ pub struct KvKeyArgs {
     pub key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Answer the value as base64 ([`KV_VALUE_BASE64`]). A coordinator that
+    /// predates it answers an array, which reads too.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub base64: bool,
 }
 
 /// Args for the `kv_put` / `kv_put_if_absent` slots.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KvPutArgs {
     pub key: String,
-    pub value: Vec<u8>,
+    pub value: WireBytes,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -303,6 +315,9 @@ pub struct KvListPrefixArgs {
     pub cursor: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Answer the values as base64 ([`KV_VALUE_BASE64`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub base64: bool,
 }
 
 /// One `(key, entry)` pair in a `kv_list_prefix` reply.
@@ -352,16 +367,16 @@ pub struct KvPageWire {
 }
 
 impl KvPageWire {
-    /// Encode a [`KvPage`] for the wire.
+    /// Encode a [`KvPage`] for the wire, its values as base64 or as arrays.
     #[must_use]
-    pub fn from_page(page: &KvPage) -> Self {
+    pub fn from_page(page: &KvPage, base64: bool) -> Self {
         Self {
             entries: page
                 .entries
                 .iter()
                 .map(|(key, entry)| KvListEntryWire {
                     key: key.clone(),
-                    entry: KvEntryWire::from_entry(entry),
+                    entry: KvEntryWire::from_entry(entry, base64),
                 })
                 .collect(),
             next: page.next.clone(),
@@ -436,13 +451,30 @@ mod wire_tests {
             bytes: Bytes::from_static(b"hello"),
             expires_at: Some(at),
         };
-        let wire = KvEntryWire::from_entry(&entry);
-        assert_eq!(wire.expires_at_unix_ms, Some(1_700_000_000_123));
-        let json = serde_json::to_string(&wire).unwrap();
-        let back: KvEntryWire = serde_json::from_str(&json).unwrap();
-        let decoded = back.into_entry();
-        assert_eq!(decoded.bytes.as_ref(), b"hello");
-        assert_eq!(decoded.expires_at, Some(at));
+        for base64 in [false, true] {
+            let wire = KvEntryWire::from_entry(&entry, base64);
+            assert_eq!(wire.expires_at_unix_ms, Some(1_700_000_000_123));
+            let json = serde_json::to_string(&wire).unwrap();
+            assert_eq!(json.contains("\"aGVsbG8=\""), base64, "{json}");
+            let back: KvEntryWire = serde_json::from_str(&json).unwrap();
+            let decoded = back.into_entry();
+            assert_eq!(decoded.bytes.as_ref(), b"hello");
+            assert_eq!(decoded.expires_at, Some(at));
+        }
+    }
+
+    /// A value reads in either form, and args from a host that predates
+    /// `base64` read as before.
+    #[test]
+    fn values_read_in_either_form() {
+        let old: KvPutArgs = serde_json::from_str(r#"{"key":"k","value":[118]}"#).unwrap();
+        assert_eq!(old.value, WireBytes::new(b"v".to_vec(), false));
+        let new: KvPutArgs = serde_json::from_str(r#"{"key":"k","value":"dg=="}"#).unwrap();
+        assert_eq!(new.value, WireBytes::new(b"v".to_vec(), true));
+        let get: KvKeyArgs = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
+        assert!(!get.base64);
+        let get: KvKeyArgs = serde_json::from_str(r#"{"key":"k","base64":true}"#).unwrap();
+        assert!(get.base64);
     }
 
     #[test]
@@ -451,7 +483,7 @@ mod wire_tests {
             bytes: Bytes::from_static(b"x"),
             expires_at: None,
         };
-        let wire = KvEntryWire::from_entry(&entry);
+        let wire = KvEntryWire::from_entry(&entry, false);
         assert_eq!(wire.expires_at_unix_ms, None);
         let json = serde_json::to_string(&wire).unwrap();
         assert!(!json.contains("expires_at_unix_ms"));
@@ -471,7 +503,7 @@ mod wire_tests {
             )],
             next: Some("c1".to_owned()),
         };
-        let json = serde_json::to_string(&KvPageWire::from_page(&page)).unwrap();
+        let json = serde_json::to_string(&KvPageWire::from_page(&page, true)).unwrap();
         let reply: KvListReplyWire = serde_json::from_str(&json).unwrap();
         assert!(reply.is_page());
         let back = reply.into_page();
@@ -499,6 +531,7 @@ mod wire_tests {
             page: false,
             cursor: None,
             store: None,
+            base64: false,
         };
         assert_eq!(
             serde_json::to_string(&args).unwrap(),
