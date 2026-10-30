@@ -58,8 +58,8 @@ pub use backend::{
 };
 pub use error::ClusterError;
 pub use key_value::{
-    Entry, KV_VALUE_BASE64, KeyValueStore, KvEntryWire, KvExpireArgs, KvIncrArgs, KvKeyArgs,
-    KvListEntryWire, KvListPrefixArgs, KvListReplyWire, KvPage, KvPageWire, KvPutArgs,
-    LIST_PAGE_SIZE, WireBytes, counter_overflow, list_all, parse_counter,
+    Entry, KV_INCR_FLOOR, KV_VALUE_BASE64, KeyValueStore, KvEntryWire, KvExpireArgs, KvIncrArgs,
+    KvKeyArgs, KvListEntryWire, KvListPrefixArgs, KvListReplyWire, KvPage, KvPageWire, KvPutArgs,
+    LIST_PAGE_SIZE, WireBytes, counter_overflow, floor_add, list_all, parse_counter,
 };
 pub use pub_sub::{Message, PubSub, Subscription};

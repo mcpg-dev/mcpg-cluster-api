@@ -116,6 +116,119 @@ where
     incr_no_lost_updates_under_interleaved_callers(&make_state).await;
     incr_rejects_non_integer_values(&make_state).await;
     incr_ttl_slides_and_purges(timing, &make_state).await;
+    if supports_incr_floor(&make_state).await {
+        incr_floor_raises_then_adds(&make_state).await;
+        incr_floor_no_lost_updates_under_interleaved_callers(&make_state).await;
+        incr_floor_rejects_non_integer_values(&make_state).await;
+        incr_floor_restarts_an_expired_counter(timing, &make_state).await;
+    }
+}
+
+/// Whether the store implements `incr_floor`. One that answers
+/// `Unsupported` (the trait's default) opts out, and its callers fall back
+/// to `incr`; a backend that must have it asserts that next to its own run.
+pub async fn supports_incr_floor<F, Fut>(make_state: &F) -> bool
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    !matches!(
+        s.incr_floor("incr-floor-probe", 0, 0, None).await,
+        Err(crate::error::ClusterError::Unsupported { .. })
+    )
+}
+
+async fn incr_floor_raises_then_adds<F, Fut>(make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    assert_eq!(
+        s.incr_floor("ctr", 3, 100, None).await.unwrap(),
+        103,
+        "a missing key counts as 0, raised to the floor"
+    );
+    assert_eq!(
+        s.incr_floor("ctr", 2, 50, None).await.unwrap(),
+        105,
+        "a counter above the floor only adds"
+    );
+    assert_eq!(
+        s.incr_floor("ctr", 1, 200, None).await.unwrap(),
+        201,
+        "a counter below the floor is raised to it, then added to"
+    );
+    assert_eq!(s.incr_floor("ctr", -1, 0, None).await.unwrap(), 200);
+    let raw = s.get("ctr").await.unwrap().expect("counter key exists");
+    assert_eq!(&raw.bytes[..], b"200", "stored as ASCII base-10, as incr");
+    assert_eq!(s.incr("ctr", 1, None).await.unwrap(), 201, "incr reads it");
+}
+
+/// Callers that all raise an idle counter to one floor count the floor
+/// once: the raise and the add are one step.
+async fn incr_floor_no_lost_updates_under_interleaved_callers<F, Fut>(make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+    let s = make_state().await;
+    const CALLERS: i64 = 40;
+    const FLOOR: i64 = 1_000;
+    let mut in_flight: FuturesUnordered<_> = (0..CALLERS)
+        .map(|_| {
+            let s = Arc::clone(&s);
+            async move { s.incr_floor("ctr", 1, FLOOR, None).await.unwrap() }
+        })
+        .collect();
+    let mut seen = std::collections::BTreeSet::new();
+    while let Some(v) = in_flight.next().await {
+        assert!(
+            seen.insert(v),
+            "two callers observed the same post-increment value {v}"
+        );
+    }
+    assert_eq!(
+        s.incr("ctr", 0, None).await.unwrap(),
+        FLOOR + CALLERS,
+        "the floor is counted once and no increment is lost"
+    );
+}
+
+async fn incr_floor_rejects_non_integer_values<F, Fut>(make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    s.put("blob", Bytes::from_static(b"not-a-number"), None)
+        .await
+        .unwrap();
+    let r = s.incr_floor("blob", 1, 10, None).await;
+    assert!(
+        r.is_err(),
+        "incr_floor on a non-integer value must error, got {r:?}"
+    );
+    let raw = s.get("blob").await.unwrap().expect("value survives");
+    assert_eq!(&raw.bytes[..], b"not-a-number");
+}
+
+async fn incr_floor_restarts_an_expired_counter<F, Fut>(timing: KvContractTiming, make_state: &F)
+where
+    F: Fn() -> Fut,
+    Fut: Future<Output = Arc<dyn KeyValueStore>>,
+{
+    let s = make_state().await;
+    let ttl = timing.short_ttl;
+    assert_eq!(s.incr_floor("idle", 1, 10, Some(ttl)).await.unwrap(), 11);
+    pause(ttl + timing.expiry_slack).await;
+    assert_eq!(
+        s.incr_floor("idle", 1, 5, Some(ttl)).await.unwrap(),
+        6,
+        "an expired counter counts as 0 again"
+    );
 }
 
 async fn put_if_absent_is_single_winner<F, Fut>(make_state: &F)

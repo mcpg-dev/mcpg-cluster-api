@@ -212,6 +212,38 @@ pub trait KeyValueStore: Send + Sync + std::fmt::Debug {
     /// TTL).
     async fn incr(&self, key: &str, delta: i64, ttl: Option<Duration>)
     -> Result<i64, ClusterError>;
+
+    /// Atomically raise the counter under `key` to at least `floor`, add
+    /// `delta`, and return the result: `max(current, floor) + delta`, where a
+    /// missing (or expired) key counts as 0. Same atomicity, storage form and
+    /// `ttl` semantics as [`Self::incr`].
+    ///
+    /// A rate bucket needs the raise and the add as one step: two replicas
+    /// that each raise an idle counter to the clock and then add would both
+    /// count the idle time. A backend that cannot do it atomically answers
+    /// [`ClusterError::Unsupported`] — the default — and the caller falls
+    /// back to what [`Self::incr`] can do.
+    async fn incr_floor(
+        &self,
+        key: &str,
+        delta: i64,
+        floor: i64,
+        ttl: Option<Duration>,
+    ) -> Result<i64, ClusterError> {
+        let _ = (key, delta, floor, ttl);
+        Err(ClusterError::Unsupported {
+            reason: "incr_floor is not supported by this store".into(),
+        })
+    }
+}
+
+/// `max(current, floor) + delta`, the value [`KeyValueStore::incr_floor`]
+/// stores; overflow is a [`ClusterError::Precondition`].
+pub fn floor_add(current: i64, floor: i64, delta: i64) -> Result<i64, ClusterError> {
+    current
+        .max(floor)
+        .checked_add(delta)
+        .ok_or_else(counter_overflow)
 }
 
 // ---------------------------------------------------------------------------
@@ -233,6 +265,12 @@ pub trait KeyValueStore: Send + Sync + std::fmt::Debug {
 /// writes base64 only to a coordinator that lists it; both sides read either
 /// form, so a host and a coordinator of different releases work together.
 pub const KV_VALUE_BASE64: &str = "kv-value-base64";
+
+/// The wire feature a coordinator lists under `wire_features` when its
+/// `kv_incr` slot honours [`KvIncrArgs::floor`] ([`KeyValueStore::incr_floor`]).
+/// The host sends `floor` only to a coordinator that lists it: one that does
+/// not would ignore the field and add without the raise.
+pub const KV_INCR_FLOOR: &str = "kv-incr-floor";
 
 /// Wire form of an [`Entry`]. `expires_at_unix_ms` is the absolute expiry as
 /// milliseconds since the Unix epoch (None == no TTL).
@@ -417,6 +455,11 @@ pub struct KvIncrArgs {
     pub ttl_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub store: Option<String>,
+    /// Raise the counter to at least this value before adding `delta`
+    /// ([`KeyValueStore::incr_floor`]); only for a coordinator that lists
+    /// [`KV_INCR_FLOOR`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub floor: Option<i64>,
 }
 
 /// Decode a stored counter value for [`KeyValueStore::incr`]. Strict
